@@ -5,9 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "node ./node_modules/vite/bin/vite.js build",
-    "preview": "vite preview",
-    "postinstall": "node ./scripts/fix-vite-chunks.cjs"
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "engines": {
     "node": "20.x"
