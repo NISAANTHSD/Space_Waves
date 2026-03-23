@@ -77,6 +77,16 @@ body::after {
   animation: nebulaShift 16s ease-in-out infinite;
 }
 
+body.ingame {
+  background: #0b111b;
+}
+
+body.ingame::before,
+body.ingame::after {
+  animation: none;
+  opacity: 0;
+}
+
 #root {
   min-height: 100vh;
   position: relative;
@@ -115,6 +125,12 @@ body::after {
   pointer-events: none;
   z-index: 0;
   animation: auroraDrift 18s ease-in-out infinite;
+}
+
+.site.site--ingame::before,
+.site.site--ingame::after {
+  animation: none;
+  opacity: 0;
 }
 
 .site.high-contrast {

@@ -3727,6 +3727,14 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.body.classList.toggle("ingame", inGame);
+    return () => {
+      document.body.classList.remove("ingame");
+    };
+  }, [inGame]);
+
+  useEffect(() => {
     localStorage.setItem(profileKey("xp"), String(xp));
   }, [xp, profileKey]);
 
