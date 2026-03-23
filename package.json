@@ -13,8 +13,8 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.2.1",
-    "vite": "^5.4.10"
+    "@vitejs/plugin-react": "4.2.1",
+    "vite": "5.4.21"
   },
   "engines": {
     "node": "24.x"
