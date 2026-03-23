@@ -36,6 +36,17 @@ const adjustColor = (hex, amount) => {
     .toString(16)
     .padStart(2, "0")}`;
 };
+const hexToRgba = (hex, alpha = 1) => {
+  if (!hex || hex[0] !== "#") return `rgba(255,255,255,${alpha})`;
+  const value = hex.length === 4
+    ? `${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`
+    : hex.slice(1, 7);
+  if (value.length !== 6) return `rgba(255,255,255,${alpha})`;
+  const r = parseInt(value.slice(0, 2), 16);
+  const g = parseInt(value.slice(2, 4), 16);
+  const b = parseInt(value.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+};
 const XP_BASE = 120;
 const RANKS = [
   { name: "Rookie", min: 1 },
@@ -62,6 +73,8 @@ const rankFromLevel = (level) => {
 };
 const MAX_LEVEL_SPEED_BONUS = 120;
 const SPIKE_HEIGHT_RATIO = Math.sqrt(3) / 2;
+const SPIKE_SIZE_SCALE = 1.25;
+const RECT_SPIKE_SCALE = 0.85;
 const CHALLENGE_TARGETS = [22, 46, 70, 100];
 const CHALLENGE_BASE_TIME = 11.5;
 const TRAIL_STYLES = [
@@ -727,6 +740,9 @@ function createGame(canvas, callbacks, profileId) {
     running: false,
     paused: false,
     last: 0,
+    accumulator: 0,
+    step: 1 / 60,
+    maxSubSteps: 4,
     offset: 0,
     progress: 0,
     profileId: initialProfileId,
@@ -758,6 +774,7 @@ function createGame(canvas, callbacks, profileId) {
     finishX: 0,
     avgDt: 0,
     lowPerf: false,
+    perfScale: 1,
     completing: false,
     completeTime: 0,
     completeDuration: 3.6,
@@ -1035,7 +1052,7 @@ function createGame(canvas, callbacks, profileId) {
 
   const addEdgeSpike = (x, isTop, patternIndex, stepIndex) => {
     const bounds = getBounds(x);
-    const baseHalf = config.spikeSize * 1.4;
+    const baseHalf = config.spikeSize * 1.4 * SPIKE_SIZE_SCALE;
     const height = baseHalf * 2 * SPIKE_HEIGHT_RATIO;
     if (isTop) {
       const y = bounds.top;
@@ -1047,7 +1064,7 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const addWallSpike = (x, y, direction, patternIndex, stepIndex) => {
-    const size = config.spikeSize * 0.9;
+    const size = config.spikeSize * 0.9 * SPIKE_SIZE_SCALE;
     const height = size * 2 * SPIKE_HEIGHT_RATIO;
     const ax = x;
     const ay = y - size;
@@ -1102,7 +1119,7 @@ function createGame(canvas, callbacks, profileId) {
 
   const addBigEdgeSpike = (x, isTop, patternIndex, stepIndex) => {
     const bounds = getBounds(x);
-    const baseHalf = config.spikeSize * 1.2;
+    const baseHalf = config.spikeSize * 1.2 * SPIKE_SIZE_SCALE;
     const height = baseHalf * 2 * SPIKE_HEIGHT_RATIO;
     const spacing = baseHalf * 1.6;
     const baseY = isTop ? bounds.top : bounds.bottom;
@@ -1816,7 +1833,7 @@ function createGame(canvas, callbacks, profileId) {
       stars = [];
       return;
     }
-    const density = state.forceLowPerf ? 52000 : 36000;
+    const density = state.forceLowPerf ? 70000 : 52000;
     const count = Math.max(18, Math.round((state.width * state.height) / density));
     stars = Array.from({ length: count }, () => ({
       x: rand(0, state.width),
@@ -1826,6 +1843,27 @@ function createGame(canvas, callbacks, profileId) {
       speed: rand(0.5, 1.1),
       depth: rand(0.2, 0.6),
     }));
+  };
+
+  const updateStars = (dt, speed) => {
+    if (state.lowPerf || !stars.length) return;
+    const drift = speed * dt;
+    for (let i = 0; i < stars.length; i += 1) {
+      const star = stars[i];
+      star.x -= drift * (0.12 + star.depth * 0.35);
+      star.y += Math.sin(state.time * 0.6 + star.tw) * 0.04;
+      star.tw += dt * (0.6 + star.depth);
+      if (star.x < -80) {
+        star.x = state.width + rand(40, 100);
+        star.y = rand(-state.height * 0.2, state.height * 1.2);
+        star.tw = rand(0, Math.PI * 2);
+      }
+      if (star.y < -state.height * 0.3) {
+        star.y = state.height * 1.1;
+      } else if (star.y > state.height * 1.2) {
+        star.y = -state.height * 0.2;
+      }
+    }
   };
 
   const buildBots = () => {
@@ -1940,6 +1978,7 @@ function createGame(canvas, callbacks, profileId) {
     state.playerFinishTime = null;
     state.avgDt = 0;
     state.lowPerf = false;
+    state.perfScale = 1;
     state.timeScale = 1;
     state.impactTime = state.impactDuration;
     state.shakeTime = 0;
@@ -2012,21 +2051,32 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const drawBackground = () => {
-    ctx.fillStyle = state.theme?.bg || "#0a0a0a";
+    const theme = state.theme || THEMES.cobalt;
+    ctx.fillStyle = theme.bg || "#0a0a0a";
     ctx.fillRect(0, 0, state.width, state.height);
-    if (state.lowPerf) return;
+    if (!state.lowPerf) {
+      const glow = ctx.createLinearGradient(0, 0, 0, state.height);
+      glow.addColorStop(0, hexToRgba(theme.fillTop || "#3fd9ff", 0.12));
+      glow.addColorStop(0.5, hexToRgba(theme.fillBottom || "#1a82e6", 0.05));
+      glow.addColorStop(1, hexToRgba(theme.bg || "#0a0a0a", 0.22));
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, state.width, state.height);
+    }
+    // Removed scanline overlay for a cleaner, lighter game view.
+    if (state.lowPerf || (state.perfScale || 1) < 0.75) return;
 
     if (stars.length) {
       ctx.save();
-      ctx.globalAlpha = 0.6;
+      ctx.globalAlpha = 0.7;
       for (let i = 0; i < stars.length; i += 1) {
         const star = stars[i];
         const x = star.x;
         if (x < -60 || x > state.width + 60) continue;
         const y = star.y;
+        const twinkle = 0.55 + 0.45 * Math.sin(state.time * 2.4 + star.tw);
         ctx.beginPath();
-        ctx.arc(x, y, star.r, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(255,255,255,0.9)";
+        ctx.arc(x, y, star.r * (0.7 + twinkle * 0.5), 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255,255,255,${0.35 + twinkle * 0.4})`;
         ctx.fill();
       }
       ctx.restore();
@@ -2034,7 +2084,14 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const drawCorridorFill = () => {
-    ctx.fillStyle = state.theme?.fillBottom || "#101018";
+    const theme = state.theme || THEMES.cobalt;
+    const fillTop = theme.fillTop || "#33d1ff";
+    const fillBottom = theme.fillBottom || "#1e89e8";
+    const fillGradient = ctx.createLinearGradient(0, 0, 0, state.height);
+    fillGradient.addColorStop(0, adjustColor(fillTop, 0.06));
+    fillGradient.addColorStop(0.55, adjustColor(fillBottom, -0.02));
+    fillGradient.addColorStop(1, adjustColor(fillBottom, -0.08));
+    ctx.fillStyle = state.lowPerf ? fillBottom : fillGradient;
 
     if (corridorPath) {
       ctx.save();
@@ -2096,8 +2153,8 @@ function createGame(canvas, callbacks, profileId) {
       ctx.stroke();
     };
 
-    if (state.lowPerf) {
-      drawLine(state.theme?.edge || "#f6f2ff", 5);
+    if (state.lowPerf || (state.perfScale || 1) < 0.75) {
+      drawLine(state.theme?.edge || "#f6f2ff", 4);
       return;
     }
     drawLine("rgba(0,0,0,0.7)", 16);
@@ -2109,7 +2166,7 @@ function createGame(canvas, callbacks, profileId) {
     const colors = palette || getObstaclePalette();
     ctx.save();
     ctx.globalAlpha = 1;
-    ctx.shadowBlur = state.lowPerf ? 0 : 6;
+    ctx.shadowBlur = state.lowPerf ? 0 : 4 * (state.perfScale || 1);
     ctx.shadowColor = colors.glow || colors.fill;
     ctx.fillStyle = colors.fill;
     ctx.fillRect(x, y, width, height);
@@ -2133,9 +2190,10 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const drawRectSpikes = (x, y, width, height, direction, palette, alpha) => {
-    const spikeCount = clamp(Math.floor(width / 18), 2, 10);
+    const spikeScale = RECT_SPIKE_SCALE;
+    const spikeCount = clamp(Math.floor(width / (18 * spikeScale)), 2, 10);
     const spikeWidth = width / spikeCount;
-    const spikeHeight = Math.min(spikeWidth * SPIKE_HEIGHT_RATIO, height * 0.6);
+    const spikeHeight = Math.min(spikeWidth * SPIKE_HEIGHT_RATIO * spikeScale, height * 0.6);
     const baseY = direction === "down" ? y + height : y;
     const tipOffset = direction === "down" ? spikeHeight : -spikeHeight;
     ctx.save();
@@ -2211,7 +2269,7 @@ function createGame(canvas, callbacks, profileId) {
       ctx.lineTo(bx, by);
       ctx.lineTo(cx, cy);
       ctx.closePath();
-      ctx.shadowBlur = state.lowPerf ? 0 : 6;
+    ctx.shadowBlur = state.lowPerf ? 0 : 4 * (state.perfScale || 1);
       ctx.shadowColor = palette.glow || palette.fill;
       ctx.fillStyle = palette.fill;
       ctx.strokeStyle = "rgba(0,0,0,0.85)";
@@ -2255,12 +2313,13 @@ function createGame(canvas, callbacks, profileId) {
     const viewLeft = state.offset - 120;
     const viewRight = state.offset + state.width + 120;
     const startIndex = findFirstIndex(pickups, viewLeft - 120);
+    const simplified = state.lowPerf || (state.perfScale || 1) < 0.75;
     for (let i = startIndex; i < pickups.length; i += 1) {
       const pickup = pickups[i];
       if (pickup.x > viewRight + 120) break;
       const x = pickup.x - state.offset;
       if (x < -100 || x > state.width + 100) continue;
-      if (state.lowPerf) {
+      if (simplified) {
         ctx.save();
         ctx.translate(x, pickup.y);
         ctx.beginPath();
@@ -2488,19 +2547,20 @@ function createGame(canvas, callbacks, profileId) {
     if (trail.length < 2) return;
 
     ctx.save();
-    ctx.lineJoin = "miter";
-    ctx.lineCap = "butt";
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
 
     const lowPerf = state.lowPerf;
+    const perfScale = state.perfScale || 1;
     const pulse = lowPerf ? 0 : 0.5 + 0.5 * Math.sin(state.time * 2.2);
     const trailStyle = state.trailStyle || {
       color: state.skin.trail,
       glow: state.skin.trailGlow,
       edge: state.skin.edge,
     };
-    ctx.lineWidth = lowPerf ? 4 : 5 + pulse * 1.5;
+    ctx.lineWidth = lowPerf ? 3.5 : (4.8 + pulse * 1.4) * perfScale;
     ctx.strokeStyle = trailStyle.color;
-    ctx.shadowBlur = lowPerf ? 0 : 6 + pulse * 3;
+    ctx.shadowBlur = lowPerf ? 0 : (6 + pulse * 3) * perfScale;
     ctx.shadowColor = trailStyle.glow;
     ctx.beginPath();
     trail.forEach((point, idx) => {
@@ -2511,9 +2571,9 @@ function createGame(canvas, callbacks, profileId) {
     });
     ctx.stroke();
 
-    if (!lowPerf) {
+    if (!lowPerf && perfScale > 0.75) {
       ctx.shadowBlur = 0;
-      ctx.lineWidth = 3;
+      ctx.lineWidth = 2.6 * perfScale;
       ctx.strokeStyle = trailStyle.edge || state.skin.edge;
       ctx.beginPath();
       trail.forEach((point, idx) => {
@@ -2531,16 +2591,18 @@ function createGame(canvas, callbacks, profileId) {
   const drawBotTrails = () => {
     if (!bots.length) return;
     const lowPerf = state.lowPerf;
+    const perfScale = state.perfScale || 1;
+    if (perfScale < 0.65 && lowPerf) return;
     bots.forEach((bot) => {
       if (bot.crashed || bot.finished) return;
       if (bot.trail.length < 2) return;
       ctx.save();
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
-      ctx.globalAlpha = 0.65;
-      ctx.lineWidth = lowPerf ? 3 : 3.5;
+      ctx.globalAlpha = 0.55 + perfScale * 0.25;
+      ctx.lineWidth = lowPerf ? 2.6 : 3.2 * perfScale;
       ctx.strokeStyle = bot.skin.trail;
-      ctx.shadowBlur = lowPerf ? 0 : 5;
+      ctx.shadowBlur = lowPerf ? 0 : 4 * perfScale;
       ctx.shadowColor = bot.skin.trailGlow;
       ctx.beginPath();
       bot.trail.forEach((point, idx) => {
@@ -2591,7 +2653,7 @@ function createGame(canvas, callbacks, profileId) {
     ctx.fillStyle = bot.skin.fillTop;
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
     ctx.lineWidth = 2.2;
-    ctx.shadowBlur = state.lowPerf ? 0 : 5;
+    ctx.shadowBlur = state.lowPerf ? 0 : 3 * perfScale;
     ctx.shadowColor = bot.skin.trailGlow;
     ctx.beginPath();
     shape.main.forEach(([x, y], index) => {
@@ -2631,9 +2693,10 @@ function createGame(canvas, callbacks, profileId) {
     const shape = getPointerShape(state.shape);
     ctx.fillStyle = state.skin.fillTop;
     ctx.strokeStyle = "rgba(0,0,0,0.8)";
-    ctx.lineWidth = 3;
+    const perfScale = state.perfScale || 1;
+    ctx.lineWidth = 2.4 + perfScale * 0.8;
     const glow = 0.6 + 0.4 * Math.sin(state.time * 5);
-    ctx.shadowBlur = state.lowPerf ? 0 : 6 + glow * 4;
+    ctx.shadowBlur = state.lowPerf ? 0 : (4 + glow * 3) * perfScale;
     ctx.shadowColor = state.skin.trailGlow;
     ctx.beginPath();
     shape.main.forEach(([x, y], index) => {
@@ -2679,7 +2742,7 @@ function createGame(canvas, callbacks, profileId) {
       const trailStyle = state.trailStyle || { glow: state.skin.trailGlow };
       ctx.strokeStyle = trailStyle.glow || state.skin.trailGlow;
       ctx.lineWidth = 2.5;
-      ctx.shadowBlur = state.lowPerf ? 0 : 12;
+      ctx.shadowBlur = state.lowPerf ? 0 : 8 * perfScale;
       ctx.shadowColor = trailStyle.glow || state.skin.trailGlow;
       ctx.beginPath();
       ctx.arc(0, 0, 20 * pulse, 0, Math.PI * 2);
@@ -2796,7 +2859,7 @@ function createGame(canvas, callbacks, profileId) {
     if (state.mode !== "race" || !bots.length) return;
     const minX = Math.max(40, player.x - 140);
     const maxX = Math.max(minX + 60, Math.min(state.width - 60, player.x + 220));
-    const trailMax = state.lowPerf ? 30 : 60;
+    const trailMax = Math.max(20, Math.round((state.lowPerf ? 30 : 60) * (state.perfScale || 1)));
     bots.forEach((bot) => {
       if (bot.finished) {
         return;
@@ -3006,6 +3069,7 @@ function createGame(canvas, callbacks, profileId) {
     const speed = config.speed * startFactor + endlessRamp + raceRamp + challengeRamp + classicRamp;
     state.lastSpeed = speed;
     state.time += dt;
+    updateStars(dt, speed);
 
     if (state.waitingForInput) {
       if (input.active) {
@@ -3014,9 +3078,6 @@ function createGame(canvas, callbacks, profileId) {
         return;
       }
     }
-
-    state.avgDt = state.avgDt === 0 ? rawDt : lerp(state.avgDt, rawDt, 0.05);
-    state.lowPerf = state.forceLowPerf || state.avgDt > 0.022;
 
     if (state.crashing) {
       state.crashTime += dt;
@@ -3140,7 +3201,9 @@ function createGame(canvas, callbacks, profileId) {
     state.trailTick = !state.trailTick;
     if (!state.lowPerf || state.trailTick) {
       trail.push({ x: worldX, y: player.y });
-      const maxTrail = state.lowPerf ? Math.min(50, config.trailLength) : config.trailLength;
+      const perfScale = state.perfScale || 1;
+      const baseTrail = state.lowPerf ? Math.min(50, config.trailLength) : config.trailLength;
+      const maxTrail = Math.max(32, Math.round(baseTrail * perfScale));
       if (trail.length > maxTrail) {
         trail.splice(0, trail.length - maxTrail);
       }
@@ -3154,7 +3217,7 @@ function createGame(canvas, callbacks, profileId) {
     }
 
     const targetCameraY = getCameraY(player.y, bounds);
-    const cameraLerp = state.lowPerf ? 0.18 : 0.12;
+    const cameraLerp = state.lowPerf ? 0.2 : 0.1;
     state.cameraY = lerp(state.cameraY, targetCameraY, cameraLerp);
   };
 
@@ -3201,9 +3264,22 @@ function createGame(canvas, callbacks, profileId) {
 
   const loop = (now) => {
     if (!state.running) return;
-    const dt = Math.min((now - state.last) / 1000, 0.033);
+    const frameDt = Math.min((now - state.last) / 1000, 0.1);
     state.last = now;
-    update(dt);
+    state.avgDt = state.avgDt === 0 ? frameDt : lerp(state.avgDt, frameDt, 0.05);
+    state.lowPerf = state.forceLowPerf || state.avgDt > 0.022;
+    const perfRatio = clamp((state.avgDt - 0.016) / 0.03, 0, 1);
+    state.perfScale = clamp(1 - perfRatio * 0.45, 0.55, 1);
+    if (frameDt > 0.05) {
+      state.accumulator = 0;
+    }
+    state.accumulator = Math.min(state.accumulator + frameDt, state.step * state.maxSubSteps);
+    let steps = 0;
+    while (state.accumulator >= state.step && steps < state.maxSubSteps) {
+      update(state.step);
+      state.accumulator -= state.step;
+      steps += 1;
+    }
     render();
     requestAnimationFrame(loop);
   };
@@ -3213,6 +3289,7 @@ function createGame(canvas, callbacks, profileId) {
     state.running = true;
     state.paused = false;
     state.last = performance.now();
+    state.accumulator = 0;
     requestAnimationFrame(loop);
   };
 
@@ -3227,6 +3304,7 @@ function createGame(canvas, callbacks, profileId) {
     state.running = true;
     state.paused = false;
     state.last = performance.now();
+    state.accumulator = 0;
     requestAnimationFrame(loop);
   };
 
