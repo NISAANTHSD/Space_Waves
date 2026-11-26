@@ -1,6 +1,8 @@
 ﻿import { useEffect, useRef, useState, useCallback } from "react";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const lerp = (a, b, t) => a + (b - a) * t;
+// Frame-rate independent smoothing: `factor` is the per-frame blend at 60 FPS.
+const damp = (factor, dt) => 1 - Math.pow(1 - factor, dt * 60);
 const mulberry32 = (seed) => {
   let t = seed;
   return () => {
@@ -10,6 +12,302 @@ const mulberry32 = (seed) => {
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
   };
 };
+
+
+// -----------------------------------------------------------------------------
+// Sound engine: one shared AudioContext with a mixer (SFX + music + engine hum)
+// feeding a compressor so overlapping sounds never clip. Music is generated
+// procedurally with a look-ahead scheduler, so there are no audio files to load.
+// -----------------------------------------------------------------------------
+const SoundEngine = (() => {
+  let ctx = null;
+  let master = null;
+  let sfxBus = null;
+  let musicBus = null;
+  let humBus = null;
+  let noise = null;
+  let hum = null;
+  let musicTimer = null;
+  let nextNoteTime = 0;
+  let step = 0;
+  let intensity = 0;
+  let musicOn = false;
+  let musicEnabled = true;
+  let muted = false;
+
+  const NOTE = (n) => 440 * Math.pow(2, (n - 69) / 12);
+  // A minor progression: Am - F - C - G (root MIDI notes for bass).
+  const PROGRESSION = [
+    { root: 45, chord: [57, 60, 64, 69] },
+    { root: 41, chord: [53, 57, 60, 65] },
+    { root: 48, chord: [55, 60, 64, 67] },
+    { root: 43, chord: [55, 59, 62, 67] },
+  ];
+  const ARP_ORDER = [0, 1, 2, 3, 2, 1, 2, 3, 0, 2, 1, 3, 2, 3, 1, 2];
+  const BPM = 124;
+  const SIXTEENTH = 60 / BPM / 4;
+
+  const init = () => {
+    if (typeof window === "undefined") return null;
+    if (ctx) return ctx;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    ctx = new AudioContextClass({ latencyHint: "interactive" });
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -14;
+    comp.knee.value = 12;
+    comp.ratio.value = 4;
+    comp.attack.value = 0.004;
+    comp.release.value = 0.18;
+    master = ctx.createGain();
+    master.gain.value = muted ? 0 : 0.9;
+    sfxBus = ctx.createGain();
+    sfxBus.gain.value = 1;
+    musicBus = ctx.createGain();
+    musicBus.gain.value = 0;
+    humBus = ctx.createGain();
+    humBus.gain.value = 0;
+    sfxBus.connect(master);
+    musicBus.connect(master);
+    humBus.connect(master);
+    master.connect(comp);
+    comp.connect(ctx.destination);
+    const length = Math.floor(ctx.sampleRate * 0.5);
+    noise = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = noise.getChannelData(0);
+    for (let i = 0; i < length; i += 1) data[i] = Math.random() * 2 - 1;
+    return ctx;
+  };
+
+  const resume = () => {
+    const c = init();
+    if (c && c.state === "suspended") c.resume().catch(() => {});
+    return c;
+  };
+
+  const voice = (dest, { type = "sine", freq, endFreq, start, dur, gain, attack = 0.005, filter }) => {
+    const osc = ctx.createOscillator();
+    const amp = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, start);
+    if (endFreq) osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), start + dur);
+    amp.gain.setValueAtTime(0.0001, start);
+    amp.gain.linearRampToValueAtTime(gain, start + attack);
+    amp.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    let node = osc;
+    if (filter) {
+      const f = ctx.createBiquadFilter();
+      f.type = filter.type || "lowpass";
+      f.frequency.setValueAtTime(filter.freq, start);
+      if (filter.endFreq) f.frequency.exponentialRampToValueAtTime(filter.endFreq, start + dur);
+      f.Q.value = filter.q ?? 0.8;
+      osc.connect(f);
+      node = f;
+    }
+    node.connect(amp);
+    amp.connect(dest);
+    osc.start(start);
+    osc.stop(start + dur + 0.05);
+  };
+
+  const noiseHit = (dest, { start, dur, gain, type = "highpass", freq = 6000, q = 0.8 }) => {
+    const src = ctx.createBufferSource();
+    const f = ctx.createBiquadFilter();
+    const amp = ctx.createGain();
+    src.buffer = noise;
+    f.type = type;
+    f.frequency.value = freq;
+    f.Q.value = q;
+    amp.gain.setValueAtTime(0.0001, start);
+    amp.gain.linearRampToValueAtTime(gain, start + 0.003);
+    amp.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    src.connect(f);
+    f.connect(amp);
+    amp.connect(dest);
+    src.start(start, Math.random() * 0.3);
+    src.stop(start + dur + 0.05);
+  };
+
+  const scheduleStep = (s, t) => {
+    const bar = Math.floor(s / 16) % PROGRESSION.length;
+    const pos = s % 16;
+    const { root, chord } = PROGRESSION[bar];
+    const lvl = intensity;
+    // Kick on quarters, with an extra push at high intensity.
+    if (pos % 4 === 0 || (lvl > 0.7 && pos === 14)) {
+      voice(musicBus, { type: "sine", freq: 150, endFreq: 42, start: t, dur: 0.28, gain: 0.55 });
+    }
+    // Snare/clap on 2 and 4 once the run is underway.
+    if (lvl > 0.3 && (pos === 4 || pos === 12)) {
+      noiseHit(musicBus, { start: t, dur: 0.16, gain: 0.22, type: "bandpass", freq: 1800, q: 0.7 });
+    }
+    // Hats: offbeat 8ths, 16ths at higher intensity.
+    if (pos % 4 === 2 || (lvl > 0.55 && pos % 2 === 1)) {
+      noiseHit(musicBus, { start: t, dur: 0.045, gain: pos % 4 === 2 ? 0.12 : 0.06, freq: 7500 });
+    }
+    // Driving bass on 8ths with octave jumps.
+    if (pos % 2 === 0) {
+      const note = root + (pos % 8 === 6 ? 12 : 0);
+      voice(musicBus, {
+        type: "sawtooth",
+        freq: NOTE(note),
+        start: t,
+        dur: SIXTEENTH * 1.8,
+        gain: 0.16,
+        filter: { freq: 380 + lvl * 900, endFreq: 160, q: 4 },
+      });
+    }
+    // Arpeggio lead fades in with intensity.
+    if (lvl > 0.12) {
+      const n = chord[ARP_ORDER[pos] % chord.length] + 12;
+      voice(musicBus, {
+        type: pos % 2 ? "triangle" : "square",
+        freq: NOTE(n),
+        start: t,
+        dur: SIXTEENTH * 0.9,
+        gain: 0.035 + lvl * 0.03,
+        filter: { freq: 1600 + lvl * 2400, q: 1 },
+      });
+    }
+    // Soft pad at the start of each bar.
+    if (pos === 0) {
+      chord.slice(0, 3).forEach((n) => {
+        voice(musicBus, {
+          type: "sawtooth",
+          freq: NOTE(n),
+          start: t,
+          dur: SIXTEENTH * 15,
+          gain: 0.022,
+          attack: 0.25,
+          filter: { freq: 900, q: 0.5 },
+        });
+      });
+    }
+  };
+
+  const scheduler = () => {
+    if (!ctx || !musicOn) return;
+    while (nextNoteTime < ctx.currentTime + 0.12) {
+      scheduleStep(step, nextNoteTime);
+      nextNoteTime += SIXTEENTH;
+      step += 1;
+    }
+  };
+
+  const startMusic = () => {
+    if (!musicEnabled || muted) return;
+    const c = resume();
+    if (!c) return;
+    if (musicOn) return;
+    musicOn = true;
+    step = 0;
+    nextNoteTime = c.currentTime + 0.06;
+    musicBus.gain.cancelScheduledValues(c.currentTime);
+    musicBus.gain.setValueAtTime(0.0001, c.currentTime);
+    musicBus.gain.linearRampToValueAtTime(0.42, c.currentTime + 0.4);
+    scheduler();
+    musicTimer = window.setInterval(scheduler, 25);
+  };
+
+  const stopMusic = (fade = 0.35) => {
+    if (!ctx || !musicOn) return;
+    musicOn = false;
+    window.clearInterval(musicTimer);
+    musicTimer = null;
+    const now = ctx.currentTime;
+    musicBus.gain.cancelScheduledValues(now);
+    musicBus.gain.setValueAtTime(musicBus.gain.value, now);
+    musicBus.gain.linearRampToValueAtTime(0.0001, now + fade);
+  };
+
+  const setIntensity = (value) => {
+    intensity = clamp(value, 0, 1);
+  };
+
+  const startHum = () => {
+    if (muted) return;
+    const c = resume();
+    if (!c || hum) return;
+    const osc = c.createOscillator();
+    const sub = c.createOscillator();
+    const filter = c.createBiquadFilter();
+    osc.type = "sawtooth";
+    sub.type = "sine";
+    osc.frequency.value = 110;
+    sub.frequency.value = 55;
+    filter.type = "lowpass";
+    filter.frequency.value = 500;
+    filter.Q.value = 6;
+    osc.connect(filter);
+    sub.connect(filter);
+    filter.connect(humBus);
+    osc.start();
+    sub.start();
+    hum = { osc, sub, filter };
+    humBus.gain.cancelScheduledValues(c.currentTime);
+    humBus.gain.setValueAtTime(0.0001, c.currentTime);
+    humBus.gain.linearRampToValueAtTime(0.05, c.currentTime + 0.2);
+  };
+
+  const steer = (up) => {
+    if (!ctx || !hum) return;
+    const now = ctx.currentTime;
+    const base = up ? 150 : 104;
+    hum.osc.frequency.setTargetAtTime(base, now, 0.05);
+    hum.sub.frequency.setTargetAtTime(base / 2, now, 0.05);
+    hum.filter.frequency.setTargetAtTime(up ? 1500 : 520, now, 0.04);
+  };
+
+  const stopHum = () => {
+    if (!ctx || !hum) return;
+    const now = ctx.currentTime;
+    const h = hum;
+    hum = null;
+    humBus.gain.cancelScheduledValues(now);
+    humBus.gain.setValueAtTime(humBus.gain.value, now);
+    humBus.gain.linearRampToValueAtTime(0.0001, now + 0.15);
+    h.osc.stop(now + 0.2);
+    h.sub.stop(now + 0.2);
+  };
+
+  const setMuted = (value) => {
+    muted = !!value;
+    if (!ctx) return;
+    master.gain.setTargetAtTime(muted ? 0 : 0.9, ctx.currentTime, 0.03);
+    if (muted) {
+      stopMusic(0.05);
+      stopHum();
+    }
+  };
+
+  const setMusicEnabled = (value) => {
+    musicEnabled = !!value;
+    if (!musicEnabled) stopMusic(0.2);
+  };
+
+  return {
+    init,
+    resume,
+    get ctx() {
+      return ctx;
+    },
+    get sfx() {
+      return sfxBus;
+    },
+    get noise() {
+      return noise;
+    },
+    startMusic,
+    stopMusic,
+    setIntensity,
+    startHum,
+    stopHum,
+    steer,
+    setMuted,
+    setMusicEnabled,
+    isMusicOn: () => musicOn,
+  };
+})();
 
 const PROFILE_LIST_KEY = "spacewaves_profiles";
 const ACTIVE_PROFILE_KEY = "spacewaves_active_profile";
@@ -741,8 +1039,12 @@ function createGame(canvas, callbacks, profileId) {
     paused: false,
     last: 0,
     accumulator: 0,
-    step: 1 / 60,
-    maxSubSteps: 4,
+    step: 1 / 120,
+    slowTime: 0,
+    fastTime: 0,
+    autoLowPerf: false,
+    dprCap: 2,
+    trailClock: 0,
     offset: 0,
     progress: 0,
     profileId: initialProfileId,
@@ -876,6 +1178,264 @@ function createGame(canvas, callbacks, profileId) {
 
   const profileKey = (key) => makeProfileKey(state.profileId, key);
 
+  // ---------------------------------------------------------------------------
+  // Visual effects layer: cached backgrounds, glow sprites and a pooled particle
+  // system. Everything expensive is pre-rendered once (per theme / size) so the
+  // per-frame cost is a handful of drawImage calls instead of shadowBlur.
+  // ---------------------------------------------------------------------------
+  const fx = {
+    bgCanvas: null,
+    bgKey: "",
+    farStars: null,
+    vignette: null,
+    glowSprites: new Map(),
+    particles: [],
+    flash: 0,
+    flashColor: "#ffffff",
+    reducedMotion: false,
+    progressEmitAt: -1,
+    progressEmitValue: -1,
+    engineClock: 0,
+    fireworkClock: 0,
+    gradientKey: "",
+    corridorGradient: null,
+  };
+  const MAX_PARTICLES = 320;
+
+  const makeCanvas = (w, h) => {
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w));
+    c.height = Math.max(1, Math.round(h));
+    return c;
+  };
+
+  const getGlowSprite = (color) => {
+    let sprite = fx.glowSprites.get(color);
+    if (sprite) return sprite;
+    const size = 64;
+    sprite = makeCanvas(size, size);
+    const g = sprite.getContext("2d");
+    const grad = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.25, "rgba(255,255,255,0.55)");
+    grad.addColorStop(0.6, "rgba(255,255,255,0.15)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, size, size);
+    g.globalCompositeOperation = "source-in";
+    g.fillStyle = color;
+    g.fillRect(0, 0, size, size);
+    if (fx.glowSprites.size > 48) fx.glowSprites.clear();
+    fx.glowSprites.set(color, sprite);
+    return sprite;
+  };
+
+  const drawGlow = (x, y, radius, color, alpha = 1) => {
+    if (radius <= 0 || alpha <= 0) return;
+    const sprite = getGlowSprite(color);
+    const prevAlpha = ctx.globalAlpha;
+    ctx.globalAlpha = prevAlpha * alpha;
+    ctx.drawImage(sprite, x - radius, y - radius, radius * 2, radius * 2);
+    ctx.globalAlpha = prevAlpha;
+  };
+
+  const buildBackgroundCache = () => {
+    const theme = state.theme || THEMES.cobalt;
+    const w = state.width;
+    const h = state.height;
+    if (!w || !h) return;
+    const key = `${theme.bg}|${theme.fillTop}|${theme.fillBottom}|${w}x${h}|${state.dpr}`;
+    if (fx.bgKey === key && fx.bgCanvas) return;
+    fx.bgKey = key;
+    const scale = state.dpr;
+    const bg = makeCanvas(w * scale, h * scale);
+    const g = bg.getContext("2d");
+    g.scale(scale, scale);
+    const base = theme.bg || "#0a0a0a";
+    const deep = adjustColor(base, -0.12);
+    const grad = g.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, adjustColor(base, 0.04));
+    grad.addColorStop(0.55, base);
+    grad.addColorStop(1, deep);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, w, h);
+    // Nebula clouds seeded by theme so each level has its own sky.
+    const seedRng = mulberry32((base.charCodeAt(1) || 7) * 131 + (theme.fillTop?.charCodeAt(3) || 3) * 17);
+    const nebulaColors = [theme.fillTop, theme.fillBottom, theme.cogCore || theme.fillTop, "#7a5cff"];
+    g.globalCompositeOperation = "lighter";
+    for (let i = 0; i < 7; i += 1) {
+      const cx = seedRng() * w;
+      const cy = seedRng() * h;
+      const r = (0.25 + seedRng() * 0.45) * Math.max(w, h);
+      const color = nebulaColors[i % nebulaColors.length] || "#3fd9ff";
+      const ng = g.createRadialGradient(cx, cy, 0, cx, cy, r);
+      ng.addColorStop(0, hexToRgba(color, 0.11));
+      ng.addColorStop(0.5, hexToRgba(color, 0.04));
+      ng.addColorStop(1, hexToRgba(color, 0));
+      g.fillStyle = ng;
+      g.fillRect(0, 0, w, h);
+    }
+    g.globalCompositeOperation = "source-over";
+    fx.bgCanvas = bg;
+
+    // Tileable far-star layer that scrolls slowly for parallax depth.
+    const stars = makeCanvas(w * scale, h * scale);
+    const sg = stars.getContext("2d");
+    sg.scale(scale, scale);
+    const count = Math.round((w * h) / 2600);
+    for (let i = 0; i < count; i += 1) {
+      const x = seedRng() * w;
+      const y = seedRng() * h;
+      const r = seedRng() < 0.92 ? 0.6 + seedRng() * 0.6 : 1.2 + seedRng() * 0.8;
+      sg.globalAlpha = 0.25 + seedRng() * 0.55;
+      sg.fillStyle = seedRng() < 0.15 ? theme.fillTop || "#ffffff" : "#ffffff";
+      sg.beginPath();
+      sg.arc(x, y, r, 0, Math.PI * 2);
+      sg.fill();
+    }
+    fx.farStars = stars;
+
+    // Vignette overlay (drawn last) for a cinematic frame.
+    const vig = makeCanvas(w * scale, h * scale);
+    const vg = vig.getContext("2d");
+    vg.scale(scale, scale);
+    const vgrad = vg.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.75);
+    vgrad.addColorStop(0, "rgba(0,0,0,0)");
+    vgrad.addColorStop(1, "rgba(0,0,0,0.55)");
+    vg.fillStyle = vgrad;
+    vg.fillRect(0, 0, w, h);
+    fx.vignette = vig;
+    fx.gradientKey = "";
+  };
+
+  const spawnParticle = (p) => {
+    if (fx.particles.length >= MAX_PARTICLES) {
+      fx.particles.shift();
+    }
+    p.maxLife = p.life;
+    fx.particles.push(p);
+  };
+
+  const burst = (x, y, color, count, opts = {}) => {
+    if (state.lowPerf) count = Math.ceil(count * 0.45);
+    const speedMin = opts.speedMin ?? 60;
+    const speedMax = opts.speedMax ?? 260;
+    for (let i = 0; i < count; i += 1) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = speedMin + Math.random() * (speedMax - speedMin);
+      spawnParticle({
+        kind: "spark",
+        x,
+        y,
+        vx: Math.cos(a) * sp + (opts.vx || 0),
+        vy: Math.sin(a) * sp + (opts.vy || 0),
+        life: (opts.life ?? 0.6) * (0.6 + Math.random() * 0.6),
+        size: (opts.size ?? 3) * (0.6 + Math.random() * 0.8),
+        color,
+        drag: opts.drag ?? 2.4,
+        gravity: opts.gravity ?? 0,
+      });
+    }
+  };
+
+  const ring = (x, y, color, radius = 60, life = 0.45, width = 3) => {
+    spawnParticle({ kind: "ring", x, y, vx: 0, vy: 0, life, size: radius, color, width, drag: 0, gravity: 0 });
+  };
+
+  const flash = (amount, color = "#ffffff") => {
+    if (fx.reducedMotion) amount *= 0.35;
+    fx.flash = Math.max(fx.flash, amount);
+    fx.flashColor = color;
+  };
+
+  const updateParticles = (dt) => {
+    const list = fx.particles;
+    let write = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const p = list[i];
+      p.life -= dt;
+      if (p.life <= 0) continue;
+      if (p.drag) {
+        const k = Math.exp(-p.drag * dt);
+        p.vx *= k;
+        p.vy *= k;
+      }
+      p.vy += p.gravity * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      list[write] = p;
+      write += 1;
+    }
+    list.length = write;
+    if (fx.flash > 0) fx.flash = Math.max(0, fx.flash - dt * 3.2);
+  };
+
+  const drawParticles = () => {
+    const list = fx.particles;
+    if (!list.length) return;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const off = state.offset;
+    for (let i = 0; i < list.length; i += 1) {
+      const p = list[i];
+      const x = p.x - off;
+      if (x < -120 || x > state.width + 120) continue;
+      const t = p.life / p.maxLife;
+      if (p.kind === "ring") {
+        const r = p.size * (1 - t * t * 0.9) + 4;
+        ctx.globalAlpha = t * 0.9;
+        ctx.strokeStyle = p.color;
+        ctx.lineWidth = p.width * t + 0.5;
+        ctx.beginPath();
+        ctx.arc(x, p.y, r, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        const size = p.size * (0.4 + t * 0.6);
+        drawGlow(x, p.y, size * 3, p.color, t * 0.8);
+        ctx.globalAlpha = Math.min(1, t * 1.4);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(x - size * 0.35, p.y - size * 0.35, size * 0.7, size * 0.7);
+      }
+    }
+    ctx.restore();
+  };
+
+  const emitProgress = (progress) => {
+    // React re-renders the whole HUD on every callback, so only report progress when
+    // the visible value changes and at most ~12 times per second.
+    const rounded = Math.round(progress * 10) / 10;
+    if (rounded === fx.progressEmitValue) return;
+    const now = state.time;
+    if (rounded < 100 && rounded > 0 && now - fx.progressEmitAt < 0.08) return;
+    fx.progressEmitAt = now;
+    fx.progressEmitValue = rounded;
+    callbacks.onProgress(progress);
+  };
+
+  const emitEngineParticles = (worldX, dt, speed) => {
+    if (state.lowPerf && state.perfScale < 0.7) return;
+    fx.engineClock += dt;
+    const interval = state.lowPerf ? 1 / 30 : 1 / 75;
+    const style = state.trailStyle || { color: state.skin.trail };
+    while (fx.engineClock >= interval) {
+      fx.engineClock -= interval;
+      const back = Math.cos(player.tilt);
+      const up = Math.sin(player.tilt);
+      spawnParticle({
+        kind: "spark",
+        x: worldX - back * 10,
+        y: player.y - up * 10 + (Math.random() - 0.5) * 4,
+        vx: -speed * 0.25 + (Math.random() - 0.5) * 40,
+        vy: (Math.random() - 0.5) * 50,
+        life: 0.28 + Math.random() * 0.18,
+        size: 1.6 + Math.random() * 1.6,
+        color: style.color || state.skin.trail,
+        drag: 3,
+        gravity: 0,
+      });
+    }
+  };
+
 
   // Obstacle animation helpers (subtle pulse + float without touching player physics).
   const getObstaclePulse = (entry, amp = 0.05) =>
@@ -964,15 +1524,26 @@ function createGame(canvas, callbacks, profileId) {
     callbacks.onBest?.(state.bestProgress);
   };
 
-  const resize = () => {
-    const prevHeight = state.height;
+  const resizeCanvas = () => {
     state.width = canvas.clientWidth;
     state.height = canvas.clientHeight;
-    state.dpr = 1;
-    canvas.width = state.width * state.dpr;
-    canvas.height = state.height * state.dpr;
+    // Render at device resolution (capped) for crisp lines on retina screens.
+    const deviceDpr = window.devicePixelRatio || 1;
+    state.dpr = clamp(Math.min(deviceDpr, state.dprCap), 1, 2);
+    canvas.width = Math.round(state.width * state.dpr);
+    canvas.height = Math.round(state.height * state.dpr);
     ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
-    state.forceLowPerf = state.width < 820 || state.height < 520;
+    fx.bgKey = "";
+    buildBackgroundCache();
+  };
+
+  const resize = () => {
+    const prevHeight = state.height;
+    // Small viewports are usually phones: cap resolution instead of stripping effects.
+    const small = canvas.clientWidth < 820 || canvas.clientHeight < 520;
+    state.dprCap = state.dprDowngraded ? 1 : small ? 1.5 : 2;
+    resizeCanvas();
+    state.forceLowPerf = false;
     buildStars();
 
     if (state.levelConfig) {
@@ -1649,6 +2220,16 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const collectPickup = (pickup) => {
+    const pickupColor = pickup.type === "shield" ? state.theme.cogCore : state.theme.trail;
+    burst(pickup.x, pickup.y, pickupColor, pickup.type === "shield" ? 22 : 14, {
+      speedMin: 60,
+      speedMax: 240,
+      life: 0.55,
+      size: 2.6,
+      vx: (state.lastSpeed || config.speed) * 0.3,
+    });
+    ring(pickup.x, pickup.y, pickupColor, pickup.type === "shield" ? 70 : 42, 0.4, 3);
+    flash(pickup.type === "shield" ? 0.18 : 0.08, pickupColor);
     if (pickup.type === "shield") {
       runtime.shieldTime = config.shieldDuration;
       setShieldActive(true);
@@ -1734,9 +2315,12 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const getBounds = (worldX) => {
-    let index = 0;
-    while (index < topPoints.length - 2 && topPoints[index + 1].x < worldX) {
-      index += 1;
+    // Points are laid out on a uniform grid (x = i * spacing), so the segment index
+    // can be computed directly instead of scanning from the start of the level.
+    const lastIndex = Math.max(0, topPoints.length - 2);
+    let index = clamp(Math.floor(worldX / level.spacing), 0, lastIndex);
+    if (index > 0 && topPoints[index] && topPoints[index].x >= worldX) {
+      index -= 1;
     }
     const t0 = topPoints[index];
     const t1 = topPoints[index + 1] || t0;
@@ -1977,8 +2561,18 @@ function createGame(canvas, callbacks, profileId) {
     state.lastSpeed = 0;
     state.playerFinishTime = null;
     state.avgDt = 0;
+    state.slowTime = 0;
+    state.fastTime = 0;
     state.lowPerf = false;
     state.perfScale = 1;
+    state.trailClock = 0;
+    state.lastTrailInput = false;
+    fx.particles.length = 0;
+    fx.flash = 0;
+    fx.progressEmitAt = -1;
+    fx.progressEmitValue = -1;
+    fx.engineClock = 0;
+    fx.fireworkClock = 0;
     state.timeScale = 1;
     state.impactTime = state.impactDuration;
     state.shakeTime = 0;
@@ -2047,130 +2641,190 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const setInput = (value) => {
+    if (input.active === value) return;
     input.active = value;
+    if (state.running && !state.crashing && !state.completing) {
+      callbacks.onSteer?.(value);
+    }
+  };
+
+  const setReducedMotion = (value) => {
+    fx.reducedMotion = !!value;
   };
 
   const drawBackground = () => {
     const theme = state.theme || THEMES.cobalt;
-    ctx.fillStyle = theme.bg || "#0a0a0a";
-    ctx.fillRect(0, 0, state.width, state.height);
-    if (!state.lowPerf) {
-      const glow = ctx.createLinearGradient(0, 0, 0, state.height);
-      glow.addColorStop(0, hexToRgba(theme.fillTop || "#3fd9ff", 0.12));
-      glow.addColorStop(0.5, hexToRgba(theme.fillBottom || "#1a82e6", 0.05));
-      glow.addColorStop(1, hexToRgba(theme.bg || "#0a0a0a", 0.22));
-      ctx.fillStyle = glow;
+    if (fx.bgTheme !== theme || !fx.bgCanvas) {
+      fx.bgTheme = theme;
+      buildBackgroundCache();
+    }
+    if (fx.bgCanvas) {
+      ctx.drawImage(fx.bgCanvas, 0, 0, state.width, state.height);
+    } else {
+      ctx.fillStyle = theme.bg || "#0a0a0a";
       ctx.fillRect(0, 0, state.width, state.height);
     }
-    // Removed scanline overlay for a cleaner, lighter game view.
-    if (state.lowPerf || (state.perfScale || 1) < 0.75) return;
+    // Far star layer: slow parallax scroll, tiled horizontally.
+    if (fx.farStars) {
+      const w = state.width;
+      const shift = (state.offset * 0.04) % w;
+      ctx.globalAlpha = 0.85;
+      ctx.drawImage(fx.farStars, -shift, 0, w, state.height);
+      ctx.drawImage(fx.farStars, w - shift, 0, w, state.height);
+      ctx.globalAlpha = 1;
+    }
+    if (state.lowPerf || !stars.length) return;
 
-    if (stars.length) {
-      ctx.save();
-      ctx.globalAlpha = 0.7;
-      for (let i = 0; i < stars.length; i += 1) {
-        const star = stars[i];
-        const x = star.x;
-        if (x < -60 || x > state.width + 60) continue;
-        const y = star.y;
-        const twinkle = 0.55 + 0.45 * Math.sin(state.time * 2.4 + star.tw);
+    // Near stars become motion streaks as speed rises.
+    const speed = state.lastSpeed || config.speed;
+    const streak = state.waitingForInput || state.paused ? 0 : clamp((speed - 260) / 260, 0, 1);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.strokeStyle = "#ffffff";
+    ctx.fillStyle = "#ffffff";
+    ctx.lineCap = "round";
+    for (let i = 0; i < stars.length; i += 1) {
+      const star = stars[i];
+      const x = star.x;
+      if (x < -60 || x > state.width + 60) continue;
+      const twinkle = 0.55 + 0.45 * Math.sin(state.time * 2.4 + star.tw);
+      ctx.globalAlpha = 0.25 + twinkle * 0.45;
+      const len = streak * (10 + star.depth * 60);
+      if (len > 2) {
+        ctx.lineWidth = star.r * 1.4;
         ctx.beginPath();
-        ctx.arc(x, y, star.r * (0.7 + twinkle * 0.5), 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255,255,255,${0.35 + twinkle * 0.4})`;
-        ctx.fill();
+        ctx.moveTo(x, star.y);
+        ctx.lineTo(x + len, star.y);
+        ctx.stroke();
+      } else {
+        const r = star.r * (0.8 + twinkle * 0.6);
+        ctx.fillRect(x - r, star.y - r, r * 2, r * 2);
       }
-      ctx.restore();
+    }
+    ctx.restore();
+  };
+
+  // Visible window of the corridor (only ~15 points are on screen at a time).
+  const getVisibleRange = () => {
+    const step = level.spacing;
+    const first = clamp(Math.floor((state.offset - 40) / step), 0, Math.max(0, topPoints.length - 1));
+    const last = clamp(Math.ceil((state.offset + state.width + 40) / step), 0, Math.max(0, topPoints.length - 1));
+    return [first, last];
+  };
+
+  const traceEdge = (points, first, last, reverse = false, moveFirst = true) => {
+    const off = state.offset;
+    if (!reverse) {
+      for (let i = first; i <= last; i += 1) {
+        const pt = points[i];
+        if (i === first && moveFirst) ctx.moveTo(pt.x - off, pt.y);
+        else ctx.lineTo(pt.x - off, pt.y);
+      }
+    } else {
+      for (let i = last; i >= first; i -= 1) {
+        const pt = points[i];
+        ctx.lineTo(pt.x - off, pt.y);
+      }
     }
   };
 
   const drawCorridorFill = () => {
+    if (!topPoints.length) return;
     const theme = state.theme || THEMES.cobalt;
     const fillTop = theme.fillTop || "#33d1ff";
     const fillBottom = theme.fillBottom || "#1e89e8";
-    const fillGradient = ctx.createLinearGradient(0, 0, 0, state.height);
-    fillGradient.addColorStop(0, adjustColor(fillTop, 0.06));
-    fillGradient.addColorStop(0.55, adjustColor(fillBottom, -0.02));
-    fillGradient.addColorStop(1, adjustColor(fillBottom, -0.08));
-    ctx.fillStyle = state.lowPerf ? fillBottom : fillGradient;
-
-    if (corridorPath) {
-      ctx.save();
-      ctx.translate(-state.offset, 0);
-      ctx.fill(corridorPath);
-      ctx.restore();
-      return;
+    const gradKey = `${fillTop}|${fillBottom}|${state.height}`;
+    if (fx.gradientKey !== gradKey) {
+      const fillGradient = ctx.createLinearGradient(0, 0, 0, state.height);
+      fillGradient.addColorStop(0, adjustColor(fillTop, 0.06));
+      fillGradient.addColorStop(0.55, adjustColor(fillBottom, -0.02));
+      fillGradient.addColorStop(1, adjustColor(fillBottom, -0.08));
+      fx.corridorGradient = fillGradient;
+      fx.gradientKey = gradKey;
     }
-
+    const [first, last] = getVisibleRange();
     ctx.beginPath();
-    topPoints.forEach((point, idx) => {
-      const x = point.x - state.offset;
-      const y = point.y;
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    for (let i = bottomPoints.length - 1; i >= 0; i -= 1) {
-      const point = bottomPoints[i];
-      const x = point.x - state.offset;
-      const y = point.y;
-      ctx.lineTo(x, y);
-    }
+    traceEdge(topPoints, first, last);
+    traceEdge(bottomPoints, first, last, true);
     ctx.closePath();
+    ctx.fillStyle = state.lowPerf ? fillBottom : fx.corridorGradient;
     ctx.fill();
+
+    if (state.lowPerf) return;
+    // Scrolling energy grid inside the corridor sells the sense of speed.
+    ctx.save();
+    ctx.clip();
+    ctx.globalAlpha = 0.09;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    const cell = 56;
+    const shift = state.offset % cell;
+    ctx.beginPath();
+    for (let x = -shift; x < state.width + cell; x += cell) {
+      ctx.moveTo(x, -state.height);
+      ctx.lineTo(x, state.height * 2);
+    }
+    for (let y = -state.height; y < state.height * 2; y += cell) {
+      ctx.moveTo(0, y);
+      ctx.lineTo(state.width, y);
+    }
+    ctx.stroke();
+    // A soft light band that sweeps along the corridor.
+    const sweepX = state.width - ((state.time * 160) % (state.width + 400)) + 200;
+    const band = ctx.createLinearGradient(sweepX - 160, 0, sweepX + 160, 0);
+    band.addColorStop(0, "rgba(255,255,255,0)");
+    band.addColorStop(0.5, "rgba(255,255,255,0.6)");
+    band.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = band;
+    ctx.fillRect(sweepX - 160, -state.height, 320, state.height * 3);
+    ctx.restore();
   };
 
   const drawEdges = () => {
+    if (!topPoints.length) return;
+    const [first, last] = getVisibleRange();
+    ctx.beginPath();
+    traceEdge(topPoints, first, last);
+    traceEdge(bottomPoints, first, last);
     ctx.lineJoin = "miter";
-
-    const drawLine = (color, width) => {
-      ctx.strokeStyle = color;
-      ctx.lineWidth = width;
-
-      if (topEdgePath && bottomEdgePath) {
-        ctx.save();
-        ctx.translate(-state.offset, 0);
-        ctx.stroke(topEdgePath);
-        ctx.stroke(bottomEdgePath);
-        ctx.restore();
-        return;
-      }
-
-      ctx.beginPath();
-      topPoints.forEach((point, idx) => {
-        const x = point.x - state.offset;
-        const y = point.y;
-        if (idx === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
+    const edgeColor = state.theme?.edge || "#f6f2ff";
+    if (state.lowPerf) {
+      ctx.strokeStyle = edgeColor;
+      ctx.lineWidth = 4;
       ctx.stroke();
-
-      ctx.beginPath();
-      bottomPoints.forEach((point, idx) => {
-        const x = point.x - state.offset;
-        const y = point.y;
-        if (idx === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-    };
-
-    if (state.lowPerf || (state.perfScale || 1) < 0.75) {
-      drawLine(state.theme?.edge || "#f6f2ff", 4);
       return;
     }
-    drawLine("rgba(0,0,0,0.7)", 16);
-    drawLine(state.theme?.edge || "#f6f2ff", 6);
-    drawLine("rgba(0,0,0,0.2)", 2);
+    // Outer neon glow (additive), then the classic dark outline and bright edge.
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.strokeStyle = hexToRgba(state.theme?.fillTop || "#3fd9ff", 0.16);
+    ctx.lineWidth = 28;
+    ctx.stroke();
+    ctx.restore();
+    ctx.strokeStyle = "rgba(0,0,0,0.7)";
+    ctx.lineWidth = 16;
+    ctx.stroke();
+    ctx.strokeStyle = edgeColor;
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(0,0,0,0.2)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
   };
 
   const drawObstacleRect = (x, y, width, height, alpha = 1, palette = null) => {
     const colors = palette || getObstaclePalette();
     ctx.save();
     ctx.globalAlpha = 1;
-    ctx.shadowBlur = state.lowPerf ? 0 : 4 * (state.perfScale || 1);
-    ctx.shadowColor = colors.glow || colors.fill;
+    if (!state.lowPerf) {
+      // Cheap neon halo instead of shadowBlur.
+      ctx.strokeStyle = hexToRgba(colors.glow || colors.fill, 0.28);
+      ctx.lineWidth = 8;
+      ctx.strokeRect(x - 1, y - 1, width + 2, height + 2);
+    }
     ctx.fillStyle = colors.fill;
     ctx.fillRect(x, y, width, height);
-    ctx.shadowBlur = 0;
     ctx.lineWidth = 2;
     ctx.strokeStyle = "rgba(0,0,0,0.85)";
     ctx.strokeRect(x, y, width, height);
@@ -2244,11 +2898,14 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const drawSpikes = () => {
-    ctx.save();
+    if (!spikes.length) return;
     const palette = getObstaclePalette(0);
     const viewLeft = state.offset - 160;
     const viewRight = state.offset + state.width + 160;
     const startIndex = findFirstIndex(spikes, viewLeft - 160);
+    // All visible spikes go into one path: one fill + one stroke instead of one per spike.
+    ctx.beginPath();
+    let any = false;
     for (let i = startIndex; i < spikes.length; i += 1) {
       const spike = spikes[i];
       if (spike.minX > viewRight + 200) break;
@@ -2258,26 +2915,26 @@ function createGame(canvas, callbacks, profileId) {
       const height = spike.heightLen * pulse;
       const midX = spike.midX - state.offset;
       const midY = spike.midY;
-      const ax = midX - spike.tx * halfBase;
-      const ay = midY - spike.ty * halfBase;
-      const bx = midX + spike.tx * halfBase;
-      const by = midY + spike.ty * halfBase;
-      const cx = midX + spike.nx * height;
-      const cy = midY + spike.ny * height;
-      ctx.beginPath();
-      ctx.moveTo(ax, ay);
-      ctx.lineTo(bx, by);
-      ctx.lineTo(cx, cy);
+      ctx.moveTo(midX - spike.tx * halfBase, midY - spike.ty * halfBase);
+      ctx.lineTo(midX + spike.tx * halfBase, midY + spike.ty * halfBase);
+      ctx.lineTo(midX + spike.nx * height, midY + spike.ny * height);
       ctx.closePath();
-    ctx.shadowBlur = state.lowPerf ? 0 : 4 * (state.perfScale || 1);
-      ctx.shadowColor = palette.glow || palette.fill;
-      ctx.fillStyle = palette.fill;
-      ctx.strokeStyle = "rgba(0,0,0,0.85)";
-      ctx.lineWidth = 2;
-      ctx.fill();
-      ctx.shadowBlur = 0;
+      any = true;
+    }
+    if (!any) return;
+    ctx.save();
+    ctx.lineJoin = "round";
+    if (!state.lowPerf) {
+      ctx.strokeStyle = hexToRgba(palette.glow || palette.fill, 0.3);
+      ctx.lineWidth = 7;
       ctx.stroke();
     }
+    ctx.fillStyle = palette.fill;
+    ctx.fill();
+    ctx.lineJoin = "miter";
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
     ctx.restore();
   };
 
@@ -2342,12 +2999,19 @@ function createGame(canvas, callbacks, profileId) {
       const pulse = 1 + Math.sin(pickup.pulse) * 0.12;
       ctx.save();
       ctx.translate(x, pickup.y);
+      ctx.globalCompositeOperation = "lighter";
+      drawGlow(
+        0,
+        0,
+        pickup.r * (3.2 + Math.sin(pickup.pulse * 1.3) * 0.4),
+        pickup.type === "shield" ? state.theme.cogCore : state.theme.trail,
+        0.55
+      );
+      ctx.globalCompositeOperation = "source-over";
       ctx.scale(pulse, pulse);
       if (pickup.type === "shield") {
         ctx.lineWidth = 3;
         ctx.strokeStyle = "rgba(255,255,255,0.9)";
-        ctx.shadowBlur = 12;
-        ctx.shadowColor = state.theme.cogCore;
         ctx.beginPath();
         ctx.arc(0, 0, pickup.r, 0, Math.PI * 2);
         ctx.stroke();
@@ -2361,8 +3025,6 @@ function createGame(canvas, callbacks, profileId) {
       } else {
         ctx.rotate(pickup.pulse * 0.35);
         ctx.fillStyle = state.theme.trail;
-        ctx.shadowBlur = 10;
-        ctx.shadowColor = state.theme.trailGlow;
         const size = pickup.r * 1.15;
         const baseAlpha = ctx.globalAlpha;
         ctx.beginPath();
@@ -2399,8 +3061,17 @@ function createGame(canvas, callbacks, profileId) {
     state.impactTime = 0;
     state.impactDuration = 0.32;
     state.shakeTime = state.shakeDuration;
-    state.shakeAmp = state.lowPerf ? 6 : 10;
+    state.shakeAmp = fx.reducedMotion ? 2 : state.lowPerf ? 6 : 12;
     trail = [];
+    {
+      const style = state.trailStyle || { color: state.skin.trail };
+      burst(worldX, worldY, state.skin.fillTop, 34, { speedMin: 80, speedMax: 420, life: 0.9, size: 3.4 });
+      burst(worldX, worldY, style.color || "#ffffff", 18, { speedMin: 40, speedMax: 220, life: 0.7, size: 2.6 });
+      burst(worldX, worldY, "#ffd27a", 10, { speedMin: 120, speedMax: 320, life: 0.45, size: 2 });
+      ring(worldX, worldY, "#ffffff", 90, 0.5, 4);
+      ring(worldX, worldY, state.skin.fillTop, 150, 0.75, 3);
+      flash(0.55, "#ff6a5a");
+    }
     const count = 16;
     const forward = Math.cos(angle);
     const upward = Math.sin(angle);
@@ -2428,7 +3099,7 @@ function createGame(canvas, callbacks, profileId) {
       piece.x += piece.vx * dt;
       piece.y += piece.vy * dt;
       piece.vy += gravity * dt;
-      piece.vx *= 0.98;
+      piece.vx *= Math.pow(0.98, dt * 60);
       piece.rot += piece.rotSpeed * dt;
       return piece.life > 0;
     });
@@ -2529,6 +3200,18 @@ function createGame(canvas, callbacks, profileId) {
     if (!state.completeSoundPlayed && t >= 0.8) {
       state.completeSoundPlayed = true;
       callbacks.onCompleteSound?.();
+      flash(0.3, "#ffffff");
+    }
+    fx.fireworkClock += dt;
+    if (fx.fireworkClock > (state.lowPerf ? 0.6 : 0.32)) {
+      fx.fireworkClock = 0;
+      const colors = [state.theme.fillTop, state.theme.cogCore, "#ffe26b", "#ff5fda", "#ffffff"];
+      const color = colors[Math.floor(Math.random() * colors.length)] || "#ffffff";
+      const fxX = state.offset + state.width * (0.25 + Math.random() * 0.65);
+      const fxY = state.cameraY + state.height * (0.15 + Math.random() * 0.5);
+      burst(fxX, fxY, color, 28, { speedMin: 60, speedMax: 260, life: 1, size: 3, gravity: 120, drag: 1.6 });
+      ring(fxX, fxY, color, 70, 0.6, 2);
+      callbacks.onFirework?.();
     }
     player.x = lerp(state.completeStartX, state.completeTargetX, ease);
     player.y = lerp(state.completeStartY, state.completeTargetY, ease) + arc;
@@ -2537,10 +3220,22 @@ function createGame(canvas, callbacks, profileId) {
     const completeWorldX = state.offset + player.x;
     const completeBounds = getBounds(completeWorldX);
     const targetCameraY = getCameraY(player.y, completeBounds);
-    state.cameraY = lerp(state.cameraY, targetCameraY + drift, 0.08);
+    state.cameraY = lerp(state.cameraY, targetCameraY + drift, damp(0.08, dt));
     if (t >= 1) {
       stop(false, true);
     }
+  };
+
+  const strokeTrailPath = (points, from, to, headX, headY) => {
+    const off = state.offset;
+    ctx.beginPath();
+    for (let i = from; i <= to; i += 1) {
+      const pt = points[i];
+      if (i === from) ctx.moveTo(pt.x - off, pt.y);
+      else ctx.lineTo(pt.x - off, pt.y);
+    }
+    if (headX != null && to === points.length - 1) ctx.lineTo(headX, headY);
+    ctx.stroke();
   };
 
   const drawTrail = () => {
@@ -2548,7 +3243,7 @@ function createGame(canvas, callbacks, profileId) {
 
     ctx.save();
     ctx.lineJoin = "round";
-    ctx.lineCap = "round";
+    ctx.lineCap = "butt";
 
     const lowPerf = state.lowPerf;
     const perfScale = state.perfScale || 1;
@@ -2558,33 +3253,35 @@ function createGame(canvas, callbacks, profileId) {
       glow: state.skin.trailGlow,
       edge: state.skin.edge,
     };
-    ctx.lineWidth = lowPerf ? 3.5 : (4.8 + pulse * 1.4) * perfScale;
-    ctx.strokeStyle = trailStyle.color;
-    ctx.shadowBlur = lowPerf ? 0 : (6 + pulse * 3) * perfScale;
-    ctx.shadowColor = trailStyle.glow;
-    ctx.beginPath();
-    trail.forEach((point, idx) => {
-      const x = point.x - state.offset;
-      const y = point.y;
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-
-    if (!lowPerf && perfScale > 0.75) {
-      ctx.shadowBlur = 0;
-      ctx.lineWidth = 2.6 * perfScale;
-      ctx.strokeStyle = trailStyle.edge || state.skin.edge;
-      ctx.beginPath();
-      trail.forEach((point, idx) => {
-        const x = point.x - state.offset;
-        const y = point.y;
-        if (idx === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
+    const headX = player.x;
+    const headY = player.y;
+    const n = trail.length;
+    // Fade the tail out in a few bands (cheap taper without per-segment strokes).
+    const bands = lowPerf ? 2 : 5;
+    const per = Math.ceil((n - 1) / bands);
+    for (let b = 0; b < bands; b += 1) {
+      const from = b * per;
+      const to = Math.min(n - 1, from + per);
+      if (from >= to) continue;
+      const alpha = (b + 1) / bands;
+      if (!lowPerf) {
+        ctx.globalCompositeOperation = "lighter";
+        ctx.globalAlpha = alpha * 0.35;
+        ctx.strokeStyle = trailStyle.glow || trailStyle.color;
+        ctx.lineWidth = (12 + pulse * 4) * perfScale;
+        strokeTrailPath(trail, from, to, headX, headY);
+        ctx.globalCompositeOperation = "source-over";
+      }
+      ctx.globalAlpha = 0.35 + alpha * 0.65;
+      ctx.strokeStyle = trailStyle.color;
+      ctx.lineWidth = lowPerf ? 3.5 : (4.8 + pulse * 1.4) * perfScale;
+      strokeTrailPath(trail, from, to, headX, headY);
+      if (!lowPerf && perfScale > 0.75) {
+        ctx.strokeStyle = trailStyle.edge || state.skin.edge;
+        ctx.lineWidth = 2.2 * perfScale;
+        strokeTrailPath(trail, from, to, headX, headY);
+      }
     }
-
     ctx.restore();
   };
 
@@ -2600,10 +3297,22 @@ function createGame(canvas, callbacks, profileId) {
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
       ctx.globalAlpha = 0.55 + perfScale * 0.25;
+      if (!lowPerf) {
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        ctx.globalAlpha = 0.25;
+        ctx.lineWidth = 10 * perfScale;
+        ctx.strokeStyle = bot.skin.trailGlow;
+        ctx.beginPath();
+        bot.trail.forEach((point, idx) => {
+          if (idx === 0) ctx.moveTo(point.x - state.offset, point.y);
+          else ctx.lineTo(point.x - state.offset, point.y);
+        });
+        ctx.stroke();
+        ctx.restore();
+      }
       ctx.lineWidth = lowPerf ? 2.6 : 3.2 * perfScale;
       ctx.strokeStyle = bot.skin.trail;
-      ctx.shadowBlur = lowPerf ? 0 : 4 * perfScale;
-      ctx.shadowColor = bot.skin.trailGlow;
       ctx.beginPath();
       bot.trail.forEach((point, idx) => {
         const x = point.x - state.offset;
@@ -2648,13 +3357,16 @@ function createGame(canvas, callbacks, profileId) {
   const drawBot = (bot) => {
     ctx.save();
     ctx.translate(bot.x, bot.y);
+    if (!state.lowPerf) {
+      ctx.globalCompositeOperation = "lighter";
+      drawGlow(0, 0, 26, bot.skin.trailGlow, 0.6);
+      ctx.globalCompositeOperation = "source-over";
+    }
     ctx.rotate(bot.tilt);
     const shape = getPointerShape(state.shape);
     ctx.fillStyle = bot.skin.fillTop;
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
     ctx.lineWidth = 2.2;
-    ctx.shadowBlur = state.lowPerf ? 0 : 3 * perfScale;
-    ctx.shadowColor = bot.skin.trailGlow;
     ctx.beginPath();
     shape.main.forEach(([x, y], index) => {
       if (index === 0) ctx.moveTo(x, y);
@@ -2662,7 +3374,6 @@ function createGame(canvas, callbacks, profileId) {
     });
     ctx.closePath();
     ctx.fill();
-    ctx.shadowBlur = 0;
     ctx.stroke();
 
     ctx.fillStyle = bot.skin.fillBottom;
@@ -2688,6 +3399,14 @@ function createGame(canvas, callbacks, profileId) {
   const drawPlayer = () => {
     ctx.save();
     ctx.translate(player.x, player.y);
+    const glow = 0.6 + 0.4 * Math.sin(state.time * 5);
+    {
+      const trailStyle = state.trailStyle || { glow: state.skin.trailGlow };
+      ctx.globalCompositeOperation = "lighter";
+      drawGlow(0, 0, 30 + glow * 8, trailStyle.glow || state.skin.trailGlow, state.lowPerf ? 0.5 : 0.85);
+      drawGlow(0, 0, 12, "#ffffff", 0.35);
+      ctx.globalCompositeOperation = "source-over";
+    }
     const angle = player.tilt;
     ctx.rotate(angle);
     const shape = getPointerShape(state.shape);
@@ -2695,9 +3414,6 @@ function createGame(canvas, callbacks, profileId) {
     ctx.strokeStyle = "rgba(0,0,0,0.8)";
     const perfScale = state.perfScale || 1;
     ctx.lineWidth = 2.4 + perfScale * 0.8;
-    const glow = 0.6 + 0.4 * Math.sin(state.time * 5);
-    ctx.shadowBlur = state.lowPerf ? 0 : (4 + glow * 3) * perfScale;
-    ctx.shadowColor = state.skin.trailGlow;
     ctx.beginPath();
     shape.main.forEach(([x, y], index) => {
       if (index === 0) ctx.moveTo(x, y);
@@ -2705,7 +3421,6 @@ function createGame(canvas, callbacks, profileId) {
     });
     ctx.closePath();
     ctx.fill();
-    ctx.shadowBlur = 0;
     ctx.stroke();
 
     ctx.fillStyle = state.skin.fillBottom;
@@ -2725,11 +3440,24 @@ function createGame(canvas, callbacks, profileId) {
       const trailStyle = state.trailStyle || { glow: state.skin.trailGlow };
       ctx.strokeStyle = "rgba(255,255,255,0.85)";
       const shieldPulse = 1 + Math.sin(state.time * 6) * 0.08;
-      ctx.lineWidth = 3 + shieldPulse;
-      ctx.shadowBlur = 10 + shieldPulse * 6;
-      ctx.shadowColor = trailStyle.glow || state.skin.trailGlow;
+      ctx.globalCompositeOperation = "lighter";
+      drawGlow(0, 0, 34 * shieldPulse, trailStyle.glow || state.skin.trailGlow, 0.7);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "rgba(255,255,255,0.08)";
       ctx.beginPath();
       ctx.arc(0, 0, 16 * shieldPulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.lineWidth = 3 + shieldPulse;
+      ctx.stroke();
+      // Rotating hex segments for an energy-shield look.
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(255,255,255,0.55)";
+      ctx.beginPath();
+      for (let k = 0; k < 6; k += 1) {
+        const a0 = state.time * 2.2 + (k * Math.PI) / 3;
+        ctx.moveTo(Math.cos(a0) * 21 * shieldPulse, Math.sin(a0) * 21 * shieldPulse);
+        ctx.arc(0, 0, 21 * shieldPulse, a0, a0 + 0.6);
+      }
       ctx.stroke();
       ctx.restore();
     }
@@ -2742,8 +3470,6 @@ function createGame(canvas, callbacks, profileId) {
       const trailStyle = state.trailStyle || { glow: state.skin.trailGlow };
       ctx.strokeStyle = trailStyle.glow || state.skin.trailGlow;
       ctx.lineWidth = 2.5;
-      ctx.shadowBlur = state.lowPerf ? 0 : 8 * perfScale;
-      ctx.shadowColor = trailStyle.glow || state.skin.trailGlow;
       ctx.beginPath();
       ctx.arc(0, 0, 20 * pulse, 0, Math.PI * 2);
       ctx.stroke();
@@ -2809,7 +3535,7 @@ function createGame(canvas, callbacks, profileId) {
       piece.x += piece.vx * dt;
       piece.y += piece.vy * dt;
       piece.vy += 220 * dt;
-      piece.vx *= 0.98;
+      piece.vx *= Math.pow(0.98, dt * 60);
       piece.rot += piece.rotSpeed * dt;
       return piece.life > 0;
     });
@@ -2974,10 +3700,12 @@ function createGame(canvas, callbacks, profileId) {
       if (onTopFlat || onBottomFlat) {
         targetAngle = 0;
       }
-      bot.tilt = lerp(bot.tilt, targetAngle, 0.22);
+      bot.tilt = lerp(bot.tilt, targetAngle, damp(0.22, dt));
 
-      bot.trailTick = !bot.trailTick;
-      if (!state.lowPerf || bot.trailTick) {
+      bot.trailClock = (bot.trailClock || 0) + dt;
+      const botTrailInterval = state.lowPerf ? 1 / 30 : 1 / 60;
+      if (bot.trailClock >= botTrailInterval) {
+        bot.trailClock %= botTrailInterval;
         bot.trail.push({ x: worldX, y: bot.y });
         if (bot.trail.length > trailMax) {
           bot.trail.splice(0, bot.trail.length - trailMax);
@@ -3005,6 +3733,9 @@ function createGame(canvas, callbacks, profileId) {
       state.challengeTimeMax = clamp(state.challengeTimeMax * 0.92, 6, 16);
       state.challengeTime = state.challengeTimeMax;
       const nextTarget = state.challengeTargets[nextIndex] ?? 100;
+      ring(worldX, player.y, "#ffe26b", 120, 0.6, 4);
+      burst(worldX, player.y, "#ffe26b", 24, { speedMin: 80, speedMax: 300, life: 0.6, size: 2.8 });
+      flash(0.2, "#ffe26b");
       callbacks.onChallenge?.({
         type: "checkpoint",
         bonus,
@@ -3046,6 +3777,7 @@ function createGame(canvas, callbacks, profileId) {
       state.shakeTime = Math.max(0, state.shakeTime - rawDt);
     }
     dt = rawDt * (state.timeScale || 1);
+    updateParticles(dt);
 
     const endX = state.finishX || state.levelEndX || level.length;
     const distance = state.offset + player.x;
@@ -3155,6 +3887,12 @@ function createGame(canvas, callbacks, profileId) {
         if (runtime.shieldActive) {
           runtime.shieldTime = 0;
           setShieldActive(false);
+          callbacks.onShieldBreak?.();
+          burst(worldX, player.y, "#ffffff", 20, { speedMin: 100, speedMax: 300, life: 0.5, size: 2.4 });
+          ring(worldX, player.y, state.theme.cogCore || "#ffffff", 80, 0.45, 4);
+          flash(0.25, "#9fe8ff");
+          state.shakeTime = state.shakeDuration * 0.6;
+          state.shakeAmp = fx.reducedMotion ? 1 : 5;
           state.safeTime = 0.6;
           if (tunnelHit) {
             player.y = clamp(player.y, tunnelHit.start + player.size, tunnelHit.end - player.size);
@@ -3194,12 +3932,18 @@ function createGame(canvas, callbacks, profileId) {
     if (onTopFlat || onBottomFlat) {
       targetAngle = 0;
     }
-    player.tilt = lerp(player.tilt, targetAngle, 0.25);
+    player.tilt = lerp(player.tilt, targetAngle, damp(0.25, dt));
 
     updateBots(dt, speed, endX);
 
-    state.trailTick = !state.trailTick;
-    if (!state.lowPerf || state.trailTick) {
+    // Trail is sampled on a fixed clock (independent of the simulation step) and also
+    // whenever the player changes direction, so corners stay crisp.
+    state.trailClock += dt;
+    const trailInterval = state.lowPerf ? 1 / 30 : 1 / 60;
+    const turned = state.lastTrailInput !== input.active;
+    state.lastTrailInput = input.active;
+    if (state.trailClock >= trailInterval || turned) {
+      state.trailClock %= trailInterval;
       trail.push({ x: worldX, y: player.y });
       const perfScale = state.perfScale || 1;
       const baseTrail = state.lowPerf ? Math.min(50, config.trailLength) : config.trailLength;
@@ -3211,14 +3955,15 @@ function createGame(canvas, callbacks, profileId) {
 
     const progress = Math.min(100, (worldX / endX) * 100);
     state.progress = progress;
-    callbacks.onProgress(progress);
+    emitProgress(progress);
+    emitEngineParticles(worldX, dt, speed);
     if (updateChallenge(dt, worldX, progress)) {
       return;
     }
 
     const targetCameraY = getCameraY(player.y, bounds);
     const cameraLerp = state.lowPerf ? 0.2 : 0.1;
-    state.cameraY = lerp(state.cameraY, targetCameraY, cameraLerp);
+    state.cameraY = lerp(state.cameraY, targetCameraY, damp(cameraLerp, dt));
   };
 
   const render = () => {
@@ -3242,6 +3987,7 @@ function createGame(canvas, callbacks, profileId) {
       drawBotTrails();
       drawTrail();
     }
+    drawFinishGate();
     drawTunnelWalls();
     drawSpikes();
     drawCogs();
@@ -3259,26 +4005,95 @@ function createGame(canvas, callbacks, profileId) {
       drawBots();
       drawPlayer();
     }
+    drawParticles();
     ctx.restore();
+    drawScreenOverlays();
+  };
+
+  const drawFinishGate = () => {
+    if (state.mode === "endless") return;
+    const finishX = state.finishX || state.levelEndX;
+    if (!finishX) return;
+    const x = finishX - state.offset;
+    if (x < -80 || x > state.width + 80) return;
+    const bounds = getBounds(finishX);
+    const top = bounds.top;
+    const h = bounds.bottom - bounds.top;
+    const size = 12;
+    ctx.save();
+    if (!state.lowPerf) {
+      ctx.globalCompositeOperation = "lighter";
+      const glow = ctx.createLinearGradient(x - 60, 0, x + 60, 0);
+      glow.addColorStop(0, "rgba(255,255,255,0)");
+      glow.addColorStop(0.5, `rgba(255,255,255,${0.22 + Math.sin(state.time * 6) * 0.08})`);
+      glow.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(x - 60, top, 120, h);
+      ctx.globalCompositeOperation = "source-over";
+    }
+    // Checkered finish band.
+    const rows = Math.ceil(h / size);
+    for (let r = 0; r < rows; r += 1) {
+      for (let c = 0; c < 2; c += 1) {
+        ctx.fillStyle = (r + c) % 2 === 0 ? "rgba(255,255,255,0.9)" : "rgba(10,10,20,0.85)";
+        ctx.fillRect(x - size + c * size, top + r * size, size, Math.min(size, h - r * size));
+      }
+    }
+    ctx.restore();
+  };
+
+  const drawScreenOverlays = () => {
+    if (fx.vignette && !state.lowPerf) {
+      ctx.drawImage(fx.vignette, 0, 0, state.width, state.height);
+    }
+    if (fx.flash > 0.01) {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.globalAlpha = Math.min(0.85, fx.flash);
+      ctx.fillStyle = fx.flashColor;
+      ctx.fillRect(0, 0, state.width, state.height);
+      ctx.restore();
+    }
   };
 
   const loop = (now) => {
     if (!state.running) return;
-    const frameDt = Math.min((now - state.last) / 1000, 0.1);
+    const rawDt = Math.max(0, (now - state.last) / 1000);
     state.last = now;
-    state.avgDt = state.avgDt === 0 ? frameDt : lerp(state.avgDt, frameDt, 0.05);
-    state.lowPerf = state.forceLowPerf || state.avgDt > 0.022;
-    const perfRatio = clamp((state.avgDt - 0.016) / 0.03, 0, 1);
-    state.perfScale = clamp(1 - perfRatio * 0.45, 0.55, 1);
-    if (frameDt > 0.05) {
-      state.accumulator = 0;
+    // Clamp long frames (tab switches, GC pauses) so the player never teleports.
+    const frameDt = Math.min(rawDt, 1 / 20);
+    // Smooth the frame time; ignore huge outliers so a single hitch doesn't drop quality.
+    const sample = Math.min(rawDt, 0.05);
+    state.avgDt = state.avgDt === 0 ? sample : lerp(state.avgDt, sample, 0.04);
+    // Hysteresis: only switch quality after sustained slow/fast frames, so the visuals
+    // don't flicker between modes every few frames.
+    if (state.avgDt > 0.026) {
+      state.slowTime += frameDt;
+      state.fastTime = 0;
+    } else if (state.avgDt < 0.019) {
+      state.fastTime += frameDt;
+      state.slowTime = 0;
     }
-    state.accumulator = Math.min(state.accumulator + frameDt, state.step * state.maxSubSteps);
-    let steps = 0;
-    while (state.accumulator >= state.step && steps < state.maxSubSteps) {
-      update(state.step);
-      state.accumulator -= state.step;
-      steps += 1;
+    if (!state.autoLowPerf && state.slowTime > 1.2) state.autoLowPerf = true;
+    if (state.autoLowPerf && state.fastTime > 4) state.autoLowPerf = false;
+    if (state.autoLowPerf && state.slowTime > 3 && state.dprCap > 1) {
+      // Still slow: render fewer pixels instead of dropping effects further.
+      state.dprCap = 1;
+      state.dprDowngraded = true;
+      resizeCanvas();
+    }
+    state.lowPerf = state.forceLowPerf || state.autoLowPerf;
+    const perfRatio = clamp((state.avgDt - 0.017) / 0.03, 0, 1);
+    state.perfScale = clamp(1 - perfRatio * 0.45, 0.55, 1);
+
+    // Variable sub-stepping: simulate exactly the elapsed time, split into small steps
+    // for stable collisions. This keeps motion perfectly smooth on 60/90/120/144 Hz screens.
+    if (frameDt > 0) {
+      const steps = Math.max(1, Math.ceil(frameDt / state.step));
+      const dt = frameDt / steps;
+      for (let i = 0; i < steps && state.running; i += 1) {
+        update(dt);
+      }
     }
     render();
     requestAnimationFrame(loop);
@@ -3417,6 +4232,7 @@ function createGame(canvas, callbacks, profileId) {
     setTrail,
     setShape,
     setProfile,
+    setReducedMotion,
     attachInput,
     getBest: () => state.bestProgress,
   };
@@ -3431,6 +4247,7 @@ export default function App() {
   const bonusRef = useRef(0);
   const challengeFailRef = useRef(false);
   const audioRef = useRef(null);
+  const challengeTickRef = useRef(0);
   const playSoundRef = useRef(null);
   const noiseBufferRef = useRef(null);
   const readProfileValue = (profileId, key, fallback) => {
@@ -3564,12 +4381,13 @@ export default function App() {
   });
   const [settings, setSettings] = useState(() => {
     if (typeof window === "undefined") {
-      return { reducedMotion: false, highContrast: false, mute: false };
+      return { reducedMotion: false, highContrast: false, mute: false, music: true };
     }
     return {
       reducedMotion: localStorage.getItem("spacewaves_motion") === "reduced",
       highContrast: localStorage.getItem("spacewaves_contrast") === "high",
-      mute: false,
+      mute: localStorage.getItem("spacewaves_mute") === "true",
+      music: localStorage.getItem("spacewaves_music") !== "off",
     };
   });
   const [unlockedSkins, setUnlockedSkins] = useState(() => {
@@ -3724,6 +4542,7 @@ export default function App() {
     localStorage.setItem("spacewaves_motion", settings.reducedMotion ? "reduced" : "full");
     localStorage.setItem("spacewaves_contrast", settings.highContrast ? "high" : "normal");
     localStorage.setItem("spacewaves_mute", settings.mute ? "true" : "false");
+    localStorage.setItem("spacewaves_music", settings.music === false ? "off" : "on");
   }, [settings]);
 
   useEffect(() => {
@@ -3805,30 +4624,14 @@ export default function App() {
   }, [unlockedSkins, selectedSkin]);
 
   const ensureAudio = useCallback(() => {
-    if (typeof window === "undefined") return null;
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return null;
-    if (!audioRef.current) {
-      audioRef.current = new AudioContextClass();
-    }
-    if (audioRef.current.state === "suspended") {
-      audioRef.current.resume();
-    }
-    return audioRef.current;
+    const ctx = SoundEngine.resume();
+    audioRef.current = ctx;
+    return ctx;
   }, []);
 
   const getNoiseBuffer = useCallback((ctx) => {
     if (!ctx) return null;
-    if (!noiseBufferRef.current) {
-      const length = Math.floor(ctx.sampleRate * 0.5);
-      const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < data.length; i += 1) {
-        data[i] = Math.random() * 2 - 1;
-      }
-      noiseBufferRef.current = buffer;
-    }
-    return noiseBufferRef.current;
+    return SoundEngine.noise;
   }, []);
 
   const playTone = useCallback(
@@ -3844,7 +4647,7 @@ export default function App() {
       amp.gain.linearRampToValueAtTime(gain, startTime + 0.005);
       amp.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
       osc.connect(amp);
-      amp.connect(ctx.destination);
+      amp.connect(SoundEngine.sfx || ctx.destination);
       osc.start(startTime);
       osc.stop(startTime + duration + 0.05);
     },
@@ -3865,7 +4668,7 @@ export default function App() {
       amp.gain.linearRampToValueAtTime(gain, startTime + 0.005);
       amp.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
       osc.connect(amp);
-      amp.connect(ctx.destination);
+      amp.connect(SoundEngine.sfx || ctx.destination);
       osc.start(startTime);
       osc.stop(startTime + duration + 0.05);
     },
@@ -3891,7 +4694,7 @@ export default function App() {
       amp.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
       source.connect(filter);
       filter.connect(amp);
-      amp.connect(ctx.destination);
+      amp.connect(SoundEngine.sfx || ctx.destination);
       source.start(startTime);
       source.stop(startTime + duration + 0.05);
     },
@@ -3899,9 +4702,43 @@ export default function App() {
   );
 
   const playSound = useCallback(
-    (name) => {
+    (name, arg) => {
       if (settings.mute) return;
       switch (name) {
+        case "combo": {
+          // Pickup chime climbs a pentatonic scale with the combo count.
+          const scale = [0, 2, 4, 7, 9, 12, 14];
+          const semis = scale[Math.min(scale.length - 1, Math.max(0, (arg || 1) - 1))];
+          const base = 660 * Math.pow(2, semis / 12);
+          playTone(base, 0.08, "sine", 0.11);
+          playTone(base * 1.5, 0.07, "triangle", 0.07, 0.02);
+          playTone(base * 2, 0.12, "sine", 0.04, 0.045);
+          break;
+        }
+        case "shieldBreak":
+          playNoise(0.22, 0.16, "bandpass", 2400, 1.2);
+          playSweep(900, 180, 0.22, "triangle", 0.1);
+          playTone(1320, 0.06, "sine", 0.05, 0.01);
+          break;
+        case "checkpoint":
+          playTone(660, 0.08, "square", 0.06);
+          playTone(880, 0.08, "square", 0.06, 0.07);
+          playTone(1320, 0.18, "triangle", 0.08, 0.14);
+          playNoise(0.25, 0.04, "highpass", 5000, 0.7, 0.14);
+          break;
+        case "tick":
+          playTone(1400, 0.035, "square", 0.05);
+          break;
+        case "firework":
+          playNoise(0.35, 0.07, "lowpass", 1400 + Math.random() * 800, 0.6);
+          playTone(1800 + Math.random() * 900, 0.05, "sine", 0.025, 0.02);
+          break;
+        case "newBest":
+          playTone(523.25, 0.1, "triangle", 0.08);
+          playTone(659.25, 0.1, "triangle", 0.08, 0.08);
+          playTone(783.99, 0.1, "triangle", 0.08, 0.16);
+          playTone(1046.5, 0.25, "sine", 0.09, 0.24);
+          break;
         case "start":
           playTone(280, 0.07, "square", 0.08);
           playSweep(280, 820, 0.12, "sine", 0.12, 0.01);
@@ -3920,10 +4757,15 @@ export default function App() {
           playTone(523.25, 0.12, "sine", 0.1, 0.06);
           playTone(659.25, 0.14, "sine", 0.09, 0.12);
           playTone(880, 0.12, "triangle", 0.07, 0.2);
+          playTone(1046.5, 0.4, "sine", 0.08, 0.3);
+          playTone(1318.5, 0.5, "triangle", 0.05, 0.36);
+          playNoise(0.6, 0.05, "highpass", 6000, 0.6, 0.3);
           break;
         case "crash":
-          playNoise(0.18, 0.22, "lowpass", 500, 0.7);
-          playSweep(160, 50, 0.2, "sawtooth", 0.16, 0.01);
+          playNoise(0.45, 0.26, "lowpass", 700, 0.7);
+          playNoise(0.12, 0.12, "highpass", 3000, 0.7);
+          playSweep(220, 40, 0.35, "sawtooth", 0.16, 0.01);
+          playSweep(90, 30, 0.5, "sine", 0.3, 0.0);
           playTone(70, 0.18, "triangle", 0.12, 0.02);
           break;
         case "menu":
@@ -3955,9 +4797,7 @@ export default function App() {
 
   useEffect(() => {
     const unlock = () => {
-      const ctx = ensureAudio();
-      if (!ctx) return;
-      getNoiseBuffer(ctx);
+      ensureAudio();
     };
     window.addEventListener("pointerdown", unlock, { once: true });
     window.addEventListener("keydown", unlock, { once: true });
@@ -3968,15 +4808,40 @@ export default function App() {
   }, [ensureAudio, getNoiseBuffer]);
 
   useEffect(() => {
-    if (!audioRef.current) return;
-    if (settings.mute) {
-      audioRef.current.suspend();
-    } else {
-      audioRef.current.resume();
-    }
+    SoundEngine.setMuted(settings.mute);
   }, [settings.mute]);
 
+  // Music + engine hum run only while a run is actually being played.
+  useEffect(() => {
+    const playing = inGame && !paused && !overlay.visible && !settings.mute;
+    if (playing) {
+      SoundEngine.setIntensity(0.15);
+      if (settings.music !== false) SoundEngine.startMusic();
+      SoundEngine.startHum();
+    } else {
+      SoundEngine.stopMusic(paused ? 0.15 : 0.4);
+      SoundEngine.stopHum();
+    }
+  }, [inGame, paused, overlay.visible, settings.mute, settings.music]);
+
+  useEffect(
+    () => () => {
+      SoundEngine.stopMusic(0.05);
+      SoundEngine.stopHum();
+    },
+    []
+  );
+
+  useEffect(() => {
+    SoundEngine.setMusicEnabled(settings.music !== false);
+  }, [settings.music]);
+
+  useEffect(() => {
+    gameRef.current?.setReducedMotion(settings.reducedMotion);
+  }, [settings.reducedMotion]);
+
   const showCrash = useCallback((percent, isNew) => {
+    if (isNew && !challengeFailRef.current) playSoundRef.current?.("newBest");
     const points = scoreFromPercent(percent) + bonusRef.current;
     setLastScore(points);
     localStorage.setItem(profileKey("last_score"), String(points));
@@ -4165,13 +5030,21 @@ export default function App() {
         onProgress: (value) => {
           setProgress(value);
           setBaseScore(scoreFromPercent(value));
+          SoundEngine.setIntensity(0.15 + (value / 100) * 0.85);
         },
+        onSteer: (up) => SoundEngine.steer(up),
+        onShieldBreak: () => playSoundRef.current?.("shieldBreak"),
+        onFirework: () => playSoundRef.current?.("firework"),
         onBest: setBest,
         onCrashImpact: () => {
+          SoundEngine.stopHum();
+          SoundEngine.stopMusic(0.8);
           playCrashSfx();
         },
         onCrash: showCrash,
         onCompleteSound: () => {
+          SoundEngine.stopHum();
+          SoundEngine.stopMusic(1.2);
           playCompleteSfx();
         },
         onComplete: showComplete,
@@ -4201,6 +5074,7 @@ export default function App() {
             return;
           }
           if (payload.type === "checkpoint") {
+            playSoundRef.current?.("checkpoint");
             setBonusScore((prev) => {
               const next = prev + payload.bonus;
               bonusRef.current = next;
@@ -4221,6 +5095,11 @@ export default function App() {
             return;
           }
           if (payload.type === "update") {
+            const secs = Math.ceil(payload.timeLeft);
+            if (secs <= 3 && secs > 0 && secs !== challengeTickRef.current) {
+              playSoundRef.current?.("tick");
+            }
+            challengeTickRef.current = secs;
             setChallengeHud((prev) => ({
               ...prev,
               active: true,
@@ -4242,7 +5121,7 @@ export default function App() {
           });
           setGems((prev) => prev + payload.gems);
           setRunGems((prev) => prev + payload.gems);
-          playSoundRef.current?.("pickup");
+          playSoundRef.current?.("combo", payload.combo);
         },
         onShield: (active) => {
           setShieldActive(active);
@@ -4251,6 +5130,7 @@ export default function App() {
         onCombo: (value) => setCombo(value),
       }, activeProfileId);
       setBest(gameRef.current.getBest());
+      gameRef.current.setReducedMotion(settings.reducedMotion);
     }
     cleanupRef.current = gameRef.current.attachInput();
     return () => {
@@ -5097,6 +5977,17 @@ export default function App() {
                             <strong>{settings.mute ? "On" : "Off"}</strong>
                           </div>
                           <span className="setting-meta">Silences game sounds</span>
+                        </button>
+                        <button
+                          className={`setting-tile ${settings.music !== false ? "active" : ""}`}
+                          type="button"
+                          onClick={() => toggleSetting("music")}
+                        >
+                          <div className="setting-row">
+                            <span>Music</span>
+                            <strong>{settings.music !== false ? "On" : "Off"}</strong>
+                          </div>
+                          <span className="setting-meta">In-game soundtrack</span>
                         </button>
                       </div>
                     </div>
