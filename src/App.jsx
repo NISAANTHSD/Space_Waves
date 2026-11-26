@@ -2747,10 +2747,9 @@ function createGame(canvas, callbacks, profileId) {
     traceEdge(topPoints, first, last);
     traceEdge(bottomPoints, first, last, true);
     ctx.closePath();
-    ctx.fillStyle = state.lowPerf ? fillBottom : fx.corridorGradient;
+    ctx.fillStyle = fx.corridorGradient || fillBottom;
     ctx.fill();
 
-    if (state.lowPerf) return;
     // Scrolling energy grid inside the corridor sells the sense of speed.
     ctx.save();
     ctx.clip();
@@ -2769,6 +2768,10 @@ function createGame(canvas, callbacks, profileId) {
       ctx.lineTo(state.width, y);
     }
     ctx.stroke();
+    if (state.lowPerf) {
+      ctx.restore();
+      return;
+    }
     // A soft light band that sweeps along the corridor.
     const sweepX = state.width - ((state.time * 160) % (state.width + 400)) + 200;
     const band = ctx.createLinearGradient(sweepX - 160, 0, sweepX + 160, 0);
@@ -2789,19 +2792,15 @@ function createGame(canvas, callbacks, profileId) {
     traceEdge(bottomPoints, first, last);
     ctx.lineJoin = "miter";
     const edgeColor = state.theme?.edge || "#f6f2ff";
-    if (state.lowPerf) {
-      ctx.strokeStyle = edgeColor;
-      ctx.lineWidth = 4;
+    if (!state.lowPerf) {
+      // Outer neon glow (additive), then the classic dark outline and bright edge.
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.strokeStyle = hexToRgba(state.theme?.fillTop || "#3fd9ff", 0.16);
+      ctx.lineWidth = 28;
       ctx.stroke();
-      return;
+      ctx.restore();
     }
-    // Outer neon glow (additive), then the classic dark outline and bright edge.
-    ctx.save();
-    ctx.globalCompositeOperation = "lighter";
-    ctx.strokeStyle = hexToRgba(state.theme?.fillTop || "#3fd9ff", 0.16);
-    ctx.lineWidth = 28;
-    ctx.stroke();
-    ctx.restore();
     ctx.strokeStyle = "rgba(0,0,0,0.7)";
     ctx.lineWidth = 16;
     ctx.stroke();
@@ -3257,14 +3256,14 @@ function createGame(canvas, callbacks, profileId) {
     const headY = player.y;
     const n = trail.length;
     // Fade the tail out in a few bands (cheap taper without per-segment strokes).
-    const bands = lowPerf ? 2 : 5;
+    const bands = lowPerf ? 3 : 5;
     const per = Math.ceil((n - 1) / bands);
     for (let b = 0; b < bands; b += 1) {
       const from = b * per;
       const to = Math.min(n - 1, from + per);
       if (from >= to) continue;
       const alpha = (b + 1) / bands;
-      if (!lowPerf) {
+      {
         ctx.globalCompositeOperation = "lighter";
         ctx.globalAlpha = alpha * 0.35;
         ctx.strokeStyle = trailStyle.glow || trailStyle.color;
@@ -4043,7 +4042,7 @@ function createGame(canvas, callbacks, profileId) {
   };
 
   const drawScreenOverlays = () => {
-    if (fx.vignette && !state.lowPerf) {
+    if (fx.vignette) {
       ctx.drawImage(fx.vignette, 0, 0, state.width, state.height);
     }
     if (fx.flash > 0.01) {
